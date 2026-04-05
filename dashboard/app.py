@@ -11,7 +11,7 @@ import os, sys, time, joblib
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # ─────────────────────────────────────────────
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # ─────────────────────────────────────────────
 
 st.set_page_config(
