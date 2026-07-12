@@ -190,8 +190,6 @@ These are likely compromised credentials being used for lateral movement across 
 ├── verify_model.py            # Verification & validation report
 ├── requirements.txt
 ├── README.md
-└── .claude/
-    └── launch.json            # Streamlit launch config
 ```
 
 ---
