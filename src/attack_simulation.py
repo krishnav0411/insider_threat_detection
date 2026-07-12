@@ -1,40 +1,103 @@
 # src/attack_simulation.py
-# Stage 7: Attack Simulation Module
-# Injects synthetic insider threat personas and validates detection
+"""
+File: attack_simulation.py
+Purpose: Stage 6 — Attack Simulation. Injects synthetic insider threat
+         personas, scores them via ML + rule-based logic, and validates
+         detection performance.
+Inputs:  config.yaml — paths, rule weights
+         outputs/{user_features, user_scores, model, scaler}
+Outputs: outputs/simulated_results.csv, outputs/simulation_report.txt
+Dependencies: pandas, numpy, joblib, logging; sklearn; src.risk_scoring, src.features
+"""
 
-import pandas as pd
-import numpy as np
+import logging
 import os
 import sys
-import joblib
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
 
+import joblib
+import numpy as np
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.risk_scoring import assign_risk_level, generate_explanation
+from src.config import (
+    FEATURE_COLS, FEATURE_PATH, MODEL_SAVE_PATH, SCALER_SAVE_PATH,
+    SIM_OUTPUT_PATH, SIM_REPORT_PATH, RULE_WEIGHTS, TOTAL_RULE_WEIGHT,
+)
+from src.risk_scoring import assign_risk_level, generate_explanation, CONFIG, _load_population_means
 
-# ─────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────
-
-FEATURE_PATH      = "outputs/user_features.csv"
-MODEL_PATH        = "outputs/isolation_forest_model.pkl"
-SCALER_PATH       = "outputs/scaler.pkl"
-SIM_OUTPUT_PATH   = "outputs/simulated_results.csv"
-
-FEATURE_COLS = [
-    "login_count",
-    "off_hour_logins",
-    "weekend_logins",
-    "unique_pcs_logon",
-    "off_hour_ratio",
-    "weekend_ratio",
-    "device_connections",
-    "unique_pcs_device"
-]
+logger = logging.getLogger(__name__)
 
 SEPARATOR = "=" * 60
+
+
+# ─────────────────────────────────────────────
+# RULE-BASED SCORING
+# ─────────────────────────────────────────────
+
+def compute_rule_score(row: pd.Series) -> float:
+    """
+    Compute a rule-based risk score (0-100) by checking each feature
+    against config thresholds. Each triggered flag contributes its
+    weight to a cumulative sum normalised to 0-100.
+
+    Args:
+        row: pd.Series with feature columns (must match FEATURE_COLS).
+
+    Returns:
+        Float in [0, 100] representing rule-based risk level.
+
+    Example:
+        >>> score = compute_rule_score(user_row)
+    """
+    triggered: float = 0.0
+    cfg = CONFIG
+    rw = RULE_WEIGHTS
+
+    lc = row.get("login_count", 0)
+    ohl = row.get("off_hour_logins", 0)
+    ohr = row.get("off_hour_ratio", 0.0)
+    wl = row.get("weekend_logins", 0)
+    wr = row.get("weekend_ratio", 0.0)
+    upc = row.get("unique_pcs_logon", 0)
+    dc = row.get("device_connections", 0)
+    upd = row.get("unique_pcs_device", 0)
+    lnl = row.get("late_night_logins", 0)
+    dlr = row.get("device_to_login_ratio", 0.0)
+    pcd = row.get("pc_diversity_score", 0.0)
+    asg = row.get("avg_session_gap", 0.0)
+
+    if lc > cfg["flag_login_count"]:
+        triggered += rw["excessive_logins"]
+    if ohl > cfg["flag_off_hour_logins"]:
+        triggered += rw["off_hour_logins"]
+    elif ohr > cfg["flag_off_hour_ratio"]:
+        triggered += rw["off_hour_ratio"]
+    if ohr > 0.85 and lc < 100:
+        triggered += rw["stealth_off_hour"]
+    if wl > cfg["flag_weekend_logins"]:
+        triggered += rw["weekend_logins"]
+    elif wr > cfg["flag_weekend_ratio"]:
+        triggered += rw["weekend_ratio"]
+    if upc >= cfg["flag_unique_pcs_logon"]:
+        triggered += rw["unique_pcs_logon"]
+    if dc > cfg["flag_device_connections"]:
+        triggered += rw["device_connections"]
+    if upd >= cfg["flag_unique_pcs_device"]:
+        triggered += rw["unique_pcs_device"]
+    if lnl > cfg["flag_late_night_logins"]:
+        triggered += rw["late_night_logins"]
+    if dlr > cfg["flag_device_to_login_ratio"]:
+        triggered += rw["device_to_login_ratio"]
+    if pcd > cfg["flag_pc_diversity_score"]:
+        triggered += rw["pc_diversity_score"]
+    if asg < cfg["flag_avg_session_gap_sec"]:
+        triggered += rw["avg_session_gap"]
+
+    return round(min(triggered / TOTAL_RULE_WEIGHT * 100, 100), 2)
 
 
 # ─────────────────────────────────────────────
@@ -43,118 +106,156 @@ SEPARATOR = "=" * 60
 
 def build_attack_personas() -> pd.DataFrame:
     """
-    Define synthetic insider threat personas.
-    Each persona represents a realistic attack pattern.
+    Define 7 synthetic insider threat personas.
 
-    Feature values are deliberately extreme compared to
-    the normal user population to test detection sensitivity.
+    Each persona includes all 12 behavioural features and a description.
+    Designed to test ML sensitivity and rule-based detection logic.
 
     Returns:
-        DataFrame of simulated users with feature values
-    """
-    personas = [
+        DataFrame with 7 rows, one per persona, and 14 columns.
 
-        # ── Persona 1: Night Owl
-        # Logs in frequently but almost always after midnight
-        # Suggests unauthorized access during off-hours
+    Example:
+        >>> personas = build_attack_personas()
+    """
+    personas: List[Dict[str, Any]] = [
         {
-            "user"               : "SIM_NightOwl",
-            "login_count"        : 95,
-            "off_hour_logins"    : 88,    # 93% of logins are off-hours
-            "weekend_logins"     : 12,
-            "unique_pcs_logon"   : 2,
-            "off_hour_ratio"     : 0.93,
-            "weekend_ratio"      : 0.13,
-            "device_connections" : 8,
-            "unique_pcs_device"  : 1,
+            "user": "SIM_NightOwl",
+            "login_count": 95,
+            "off_hour_logins": 88,
+            "weekend_logins": 12,
+            "late_night_logins": 80,
+            "unique_pcs_logon": 2,
+            "off_hour_ratio": 0.93,
+            "weekend_ratio": 0.13,
+            "pc_diversity_score": 0.02,
+            "device_connections": 8,
+            "unique_pcs_device": 1,
+            "device_to_login_ratio": 0.08,
+            "avg_session_gap": 7200,
             "persona_description": (
                 "Logs in almost exclusively between midnight and 5AM. "
                 "Suggests unauthorized remote access or credential theft."
-            )
+            ),
         },
-
-        # ── Persona 2: PC Hopper
-        # Logs into many different machines across the organization
-        # Suggests lateral movement — trying to access multiple systems
         {
-            "user"               : "SIM_PCHopper",
-            "login_count"        : 120,
-            "off_hour_logins"    : 18,
-            "weekend_logins"     : 14,
-            "unique_pcs_logon"   : 14,   # Uses 14 different machines
-            "off_hour_ratio"     : 0.15,
-            "weekend_ratio"      : 0.12,
-            "device_connections" : 12,
-            "unique_pcs_device"  : 11,   # Plugs devices into 11 machines
+            "user": "SIM_PCHopper",
+            "login_count": 120,
+            "off_hour_logins": 18,
+            "weekend_logins": 14,
+            "late_night_logins": 5,
+            "unique_pcs_logon": 14,
+            "off_hour_ratio": 0.15,
+            "weekend_ratio": 0.12,
+            "pc_diversity_score": 0.12,
+            "device_connections": 12,
+            "unique_pcs_device": 11,
+            "device_to_login_ratio": 0.10,
+            "avg_session_gap": 3600,
             "persona_description": (
                 "Accesses 14 unique PCs across the organization. "
-                "Classic lateral movement pattern — searching for data or escalating privileges."
-            )
+                "Classic lateral movement pattern."
+            ),
         },
-
-        # ── Persona 3: Data Mule
-        # Connects USB/external devices to many machines
-        # Suggests bulk data exfiltration via removable media
         {
-            "user"               : "SIM_DataMule",
-            "login_count"        : 55,
-            "off_hour_logins"    : 22,
-            "weekend_logins"     : 19,
-            "unique_pcs_logon"   : 4,
-            "off_hour_ratio"     : 0.40,
-            "weekend_ratio"      : 0.35,
-            "device_connections" : 112,  # Extreme device usage
-            "unique_pcs_device"  : 9,
+            "user": "SIM_DataMule",
+            "login_count": 55,
+            "off_hour_logins": 22,
+            "weekend_logins": 19,
+            "late_night_logins": 15,
+            "unique_pcs_logon": 4,
+            "off_hour_ratio": 0.40,
+            "weekend_ratio": 0.35,
+            "pc_diversity_score": 0.07,
+            "device_connections": 112,
+            "unique_pcs_device": 9,
+            "device_to_login_ratio": 2.04,
+            "avg_session_gap": 5400,
             "persona_description": (
                 "Connects external devices 112 times across 9 machines. "
                 "High weekend and off-hours activity. "
-                "Strong indicator of bulk data exfiltration via removable media."
-            )
+                "Strong indicator of bulk data exfiltration."
+            ),
         },
-
-        # ── Persona 4: Ghost User
-        # Rarely logs in but every login is suspicious
-        # Low volume makes them harder to detect — tests model sensitivity
         {
-            "user"               : "SIM_GhostUser",
-            "login_count"        : 18,   # Very few logins
-            "off_hour_logins"    : 16,   # But nearly all are off-hours
-            "weekend_logins"     : 10,
-            "unique_pcs_logon"   : 5,
-            "off_hour_ratio"     : 0.89,
-            "weekend_ratio"      : 0.56,
-            "device_connections" : 4,
-            "unique_pcs_device"  : 4,
+            "user": "SIM_GhostUser",
+            "login_count": 18,
+            "off_hour_logins": 16,
+            "weekend_logins": 10,
+            "late_night_logins": 14,
+            "unique_pcs_logon": 5,
+            "off_hour_ratio": 0.89,
+            "weekend_ratio": 0.56,
+            "pc_diversity_score": 0.28,
+            "device_connections": 4,
+            "unique_pcs_device": 4,
+            "device_to_login_ratio": 0.22,
+            "avg_session_gap": 86400,
             "persona_description": (
-                "Minimal login activity but 89% of logins are off-hours. "
-                "Accesses 5 machines despite low total usage. "
-                "Stealth behavior — may be using stolen credentials sparingly."
-            )
+                "Minimal login activity but 89% off-hours. "
+                "Accesses 5 machines. Stealth behavior."
+            ),
         },
-
-        # ── Persona 5: Full Threat
-        # All suspicious behaviors combined at maximum intensity
-        # Should always score near 100 — the ultimate validation test
         {
-            "user"               : "SIM_FullThreat",
-            "login_count"        : 210,
-            "off_hour_logins"    : 175,
-            "weekend_logins"     : 68,
-            "unique_pcs_logon"   : 18,
-            "off_hour_ratio"     : 0.83,
-            "weekend_ratio"      : 0.32,
-            "device_connections" : 145,
-            "unique_pcs_device"  : 15,
+            "user": "SIM_FullThreat",
+            "login_count": 210,
+            "off_hour_logins": 175,
+            "weekend_logins": 68,
+            "late_night_logins": 140,
+            "unique_pcs_logon": 18,
+            "off_hour_ratio": 0.83,
+            "weekend_ratio": 0.32,
+            "pc_diversity_score": 0.09,
+            "device_connections": 145,
+            "unique_pcs_device": 15,
+            "device_to_login_ratio": 0.69,
+            "avg_session_gap": 300,
             "persona_description": (
                 "Maximum threat profile — combines all suspicious behaviors. "
-                "Extremely high logins, off-hours activity, lateral movement, "
-                "and device exfiltration. Should always be flagged High risk."
-            )
+                "Should always be flagged High risk."
+            ),
+        },
+        {
+            "user": "SIM_EmailThief",
+            "login_count": 78,
+            "off_hour_logins": 45,
+            "weekend_logins": 22,
+            "late_night_logins": 38,
+            "unique_pcs_logon": 6,
+            "off_hour_ratio": 0.58,
+            "weekend_ratio": 0.28,
+            "pc_diversity_score": 0.08,
+            "device_connections": 15,
+            "unique_pcs_device": 5,
+            "device_to_login_ratio": 0.19,
+            "avg_session_gap": 45,
+            "persona_description": (
+                "Exfiltrates data via email — 6 systems off-hours, "
+                "45s session gaps, moderate device usage."
+            ),
+        },
+        {
+            "user": "SIM_Saboteur",
+            "login_count": 42,
+            "off_hour_logins": 39,
+            "weekend_logins": 28,
+            "late_night_logins": 35,
+            "unique_pcs_logon": 9,
+            "off_hour_ratio": 0.93,
+            "weekend_ratio": 0.67,
+            "pc_diversity_score": 0.21,
+            "device_connections": 67,
+            "unique_pcs_device": 8,
+            "device_to_login_ratio": 1.60,
+            "avg_session_gap": 180,
+            "persona_description": (
+                "Sabotage pattern — 3AM device connects across 8 machines. "
+                "Extreme dev/login ratio (1.60), 3min session gaps."
+            ),
         },
     ]
 
     df = pd.DataFrame(personas)
-    print(f"  [OK] Built {len(df)} attack personas.")
+    logger.info("  Built %s attack personas.", len(df))
     return df
 
 
@@ -162,25 +263,27 @@ def build_attack_personas() -> pd.DataFrame:
 # LOAD MODEL AND SCALER
 # ─────────────────────────────────────────────
 
-def load_model_artifacts() -> tuple:
+def load_model_artifacts() -> Tuple[Any, StandardScaler]:
     """
-    Load the trained Isolation Forest model and StandardScaler
-    saved during Stage 5. These must exist before running simulation.
-    """
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            f"Model not found at '{MODEL_PATH}'\n"
-            f"-> Run python src/model.py first to train and save the model."
-        )
-    if not os.path.exists(SCALER_PATH):
-        raise FileNotFoundError(
-            f"Scaler not found at '{SCALER_PATH}'\n"
-            f"-> Run python src/model.py first."
-        )
+    Load the trained Isolation Forest model and StandardScaler from disk.
 
-    model  = joblib.load(MODEL_PATH)
-    scaler = joblib.load(SCALER_PATH)
-    print("  [OK] Model and scaler loaded successfully.")
+    Returns:
+        Tuple of (model, scaler).
+
+    Raises:
+        FileNotFoundError: If model or scaler pkl files are missing.
+
+    Example:
+        >>> model, scaler = load_model_artifacts()
+    """
+    if not os.path.exists(MODEL_SAVE_PATH):
+        raise FileNotFoundError(f"Model not found at '{MODEL_SAVE_PATH}'. Run python src/model.py first.")
+    if not os.path.exists(SCALER_SAVE_PATH):
+        raise FileNotFoundError(f"Scaler not found at '{SCALER_SAVE_PATH}'. Run python src/model.py first.")
+
+    model = joblib.load(MODEL_SAVE_PATH)
+    scaler = joblib.load(SCALER_SAVE_PATH)
+    logger.info("  Model and scaler loaded successfully.")
     return model, scaler
 
 
@@ -188,61 +291,65 @@ def load_model_artifacts() -> tuple:
 # SCORE SIMULATED PERSONAS
 # ─────────────────────────────────────────────
 
-def score_personas(
-    personas_df : pd.DataFrame,
-    model,
-    scaler      : StandardScaler
-) -> pd.DataFrame:
+def score_personas(personas_df: pd.DataFrame, model: Any, scaler: StandardScaler) -> pd.DataFrame:
     """
     Run simulated personas through the trained model.
 
-    Steps:
-    1. Extract feature matrix from persona definitions
-    2. Scale using the SAME scaler fitted on real data (critical!)
-    3. Get anomaly scores and predictions from model
-    4. Convert to 0-100 risk scores
-    5. Assign risk levels and explanations
+    Produces ML anomaly scores, rule-based scores, and a composite (60/40 blend).
+    Scores are calibrated against the real user population for consistency.
+
+    Args:
+        personas_df: DataFrame of persona definitions (from build_attack_personas).
+        model:       Trained IsolationForest.
+        scaler:      Fitted StandardScaler from training.
 
     Returns:
-        scored_personas : DataFrame with full risk scoring
+        DataFrame with ML, rule, and composite scores plus risk levels.
+
+    Example:
+        >>> scored = score_personas(personas, model, scaler)
     """
     X = personas_df[FEATURE_COLS].values
-
-    # Use the SAME scaler from training — do NOT refit
     X_scaled = scaler.transform(X)
 
-    # Get raw anomaly scores
-    raw_scores  = model.decision_function(X_scaled)
+    raw_scores = model.decision_function(X_scaled)
     predictions = model.predict(X_scaled)
 
-    # Convert to 0-100 risk score
-    # Load real data scores to use same normalization range
+    # Normalise against real user population
     if os.path.exists("outputs/user_scores.csv"):
         real_scores = pd.read_csv("outputs/user_scores.csv")
-        real_raw    = model.decision_function(
-            scaler.transform(real_scores[FEATURE_COLS].values)
-        )
-        all_raw     = np.concatenate([real_raw, raw_scores])
-        score_min   = (-1 * all_raw).min()
-        score_max   = (-1 * all_raw).max()
+        real_raw = model.decision_function(scaler.transform(real_scores[FEATURE_COLS].values))
+        all_raw = np.concatenate([real_raw, raw_scores])
+        score_min = (-1 * all_raw).min()
+        score_max = (-1 * all_raw).max()
     else:
         score_min = (-1 * raw_scores).min()
         score_max = (-1 * raw_scores).max()
 
-    inverted   = -1 * raw_scores
-    risk_scores = np.where(
+    inverted = -1 * raw_scores
+    ml_scores = np.where(
         score_max > score_min,
         ((inverted - score_min) / (score_max - score_min)) * 100,
-        50.0
+        50.0,
     ).round(2)
 
-    # Build result DataFrame
     result = personas_df.copy()
     result["raw_anomaly_score"] = np.round(raw_scores, 6)
-    result["risk_score"]        = risk_scores
-    result["is_anomaly"]        = (predictions == -1).astype(int)
-    result["risk_level"]        = result["risk_score"].apply(assign_risk_level)
-    result["risk_explanation"]  = result.apply(generate_explanation, axis=1)
+    result["ml_score"] = ml_scores
+    result["is_anomaly"] = (predictions == -1).astype(int)
+
+    result["rule_score"] = result.apply(compute_rule_score, axis=1)
+    result["composite_score"] = (0.6 * result["ml_score"] + 0.4 * result["rule_score"]).round(2)
+
+    # Load population means for contextual explanations
+    if os.path.exists("outputs/user_scores.csv"):
+        _load_population_means(pd.read_csv("outputs/user_scores.csv"))
+    elif os.path.exists(FEATURE_PATH):
+        _load_population_means(pd.read_csv(FEATURE_PATH))
+
+    result["risk_score"] = result["composite_score"]
+    result["risk_level"] = result["risk_score"].apply(assign_risk_level)
+    result["risk_explanation"] = result.apply(generate_explanation, axis=1)
 
     return result
 
@@ -251,18 +358,23 @@ def score_personas(
 # COMBINE WITH REAL DATA
 # ─────────────────────────────────────────────
 
-def combine_with_real_data(
-    scored_personas : pd.DataFrame
-) -> pd.DataFrame:
+def combine_with_real_data(scored_personas: pd.DataFrame) -> pd.DataFrame:
     """
-    Merge simulated personas into the real user feature table.
-    Adds a 'is_simulated' flag column to distinguish them.
-    Used by the dashboard to show both real and simulated users.
+    Merge scored personas into the real user dataset for the dashboard.
+
+    Args:
+        scored_personas: DataFrame output from score_personas().
+
+    Returns:
+        Combined DataFrame sorted by risk_score descending, with is_simulated flag.
+
+    Example:
+        >>> combined = combine_with_real_data(scored_personas)
     """
     real_df = pd.read_csv("outputs/user_scores.csv")
-    real_df["risk_level"]       = real_df["risk_score"].apply(assign_risk_level)
+    real_df["risk_level"] = real_df["risk_score"].apply(assign_risk_level)
     real_df["risk_explanation"] = real_df.apply(generate_explanation, axis=1)
-    real_df["is_simulated"]     = 0
+    real_df["is_simulated"] = 0
     real_df["persona_description"] = ""
 
     sim_df = scored_personas.copy()
@@ -271,133 +383,214 @@ def combine_with_real_data(
     combined = pd.concat([real_df, sim_df], ignore_index=True)
     combined = combined.sort_values("risk_score", ascending=False)
 
-    print(f"  [OK] Combined dataset: {len(combined):,} total users "
-          f"({len(real_df):,} real + {len(sim_df)} simulated)")
+    logger.info("  Combined dataset: %s total users (%s real + %s simulated)",
+                f"{len(combined):,}", f"{len(real_df):,}", len(sim_df))
     return combined
+
+
+# ─────────────────────────────────────────────
+# SAVE SIMULATION REPORT
+# ─────────────────────────────────────────────
+
+def save_simulation_report(scored_personas: pd.DataFrame) -> None:
+    """
+    Save a human-readable simulation report to outputs/simulation_report.txt
+    and print it to stdout.
+
+    Args:
+        scored_personas: DataFrame output from score_personas().
+
+    Example:
+        >>> save_simulation_report(scored_personas)
+    """
+    passed = (scored_personas["risk_level"] == "High").sum()
+    total = len(scored_personas)
+    pct = passed / total * 100
+    all_passed = passed == total
+    missed: List[str] = scored_personas[scored_personas["risk_level"] != "High"]["user"].tolist() if not all_passed else []
+
+    lines: List[str] = []
+    lines.append("=" * 70)
+    lines.append("  INSIDER THREAT DETECTION — ATTACK SIMULATION REPORT")
+    lines.append(f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("=" * 70)
+
+    for _, row in scored_personas.iterrows():
+        detected = row["risk_level"] == "High"
+        status = "[DETECTED]" if detected else "[MISSED]"
+        lines.append("")
+        lines.append("-" * 70)
+        lines.append(f"  Persona  : {row['user']}")
+        lines.append(f"  Status   : {status}")
+        lines.append(f"  Risk     : {row['risk_level']:>6}  |  "
+                      f"ML: {row['ml_score']:>6.1f}  |  "
+                      f"Rule: {row['rule_score']:>6.1f}  |  "
+                      f"Composite: {row['risk_score']:>6.1f}  |  "
+                      f"Anomaly: {'Yes' if row['is_anomaly'] else 'No'}")
+        lines.append("-" * 70)
+
+        feat_cols = [c for c in FEATURE_COLS if c in row]
+        max_nl = max(len(c) for c in feat_cols)
+        for c in feat_cols:
+            val = row[c]
+            lines.append(f"    {c:<{max_nl}} : {val:>12.4f}" if isinstance(val, float)
+                         else f"    {c:<{max_nl}} : {str(val):>12}")
+        lines.append("")
+        lines.append(f"  Description: {row['persona_description']}")
+        lines.append(f"  Flags      : {row['risk_explanation']}")
+
+    lines.append("")
+    lines.append("=" * 70)
+    lines.append("  OVERALL VALIDATION RESULT")
+    lines.append("=" * 70)
+    lines.append(f"  Personas detected as High Risk : {passed} / {total}  ({pct:.0f}%)")
+    if all_passed:
+        lines.append("  [PASS] All attack personas correctly detected.")
+    else:
+        lines.append(f"  [WARN] Missed: {missed}")
+    lines.append("=" * 70)
+
+    report_text = "\n".join(lines)
+
+    os.makedirs("outputs", exist_ok=True)
+    with open(SIM_REPORT_PATH, "w", encoding="utf-8") as f:
+        f.write(report_text)
+    logger.info("  Simulation report saved -> %s", SIM_REPORT_PATH)
+    print(report_text)
 
 
 # ─────────────────────────────────────────────
 # PRINT SIMULATION VALIDATION REPORT
 # ─────────────────────────────────────────────
 
-def print_simulation_report(scored_personas: pd.DataFrame):
+def print_simulation_report(scored_personas: pd.DataFrame) -> None:
     """
-    Print a detailed validation report for each simulated persona.
-    Checks whether the model correctly detected each threat.
+    Print a compact validation report for each simulated persona.
+
+    Args:
+        scored_personas: DataFrame output from score_personas().
+
+    Example:
+        >>> print_simulation_report(scored_personas)
     """
-    print(f"\n{SEPARATOR}")
-    print("  ATTACK SIMULATION VALIDATION REPORT")
-    print(SEPARATOR)
+    logger.info("")
+    logger.info(SEPARATOR)
+    logger.info("  ATTACK SIMULATION VALIDATION REPORT")
+    logger.info(SEPARATOR)
 
     all_passed = True
-
     for _, row in scored_personas.iterrows():
-        detected    = row["risk_level"] == "High"
-        status      = "[DETECTED]" if detected else "[MISSED]"
-        all_passed  = all_passed and detected
+        detected = row["risk_level"] == "High"
+        status = "[DETECTED]" if detected else "[MISSED]"
+        all_passed = all_passed and detected
 
         print(f"\n  Persona       : {row['user']}")
         print(f"  Status        : {status}")
-        print(f"  Risk Score    : {row['risk_score']:.1f} / 100")
+        print(f"  ML Score      : {row['ml_score']:.1f} / 100")
+        print(f"  Rule Score    : {row['rule_score']:.1f} / 100")
+        print(f"  Composite     : {row['risk_score']:.1f} / 100")
         print(f"  Risk Level    : {row['risk_level']}")
         print(f"  Is Anomaly    : {'Yes' if row['is_anomaly'] else 'No'}")
         print(f"  Description   : {row['persona_description']}")
         print(f"  Flags         : {row['risk_explanation']}")
         print(f"  {'-' * 55}")
 
-    # Overall result
-    print(f"\n{SEPARATOR}")
-    print("  OVERALL VALIDATION RESULT")
-    print(SEPARATOR)
-
     passed = scored_personas[scored_personas["risk_level"] == "High"].shape[0]
-    total  = len(scored_personas)
-    pct    = passed / total * 100
+    total = len(scored_personas)
+    pct = passed / total * 100
 
-    print(f"\n  Personas detected as High Risk : {passed} / {total}  ({pct:.0f}%)")
+    logger.info("")
+    logger.info(SEPARATOR)
+    logger.info("  OVERALL VALIDATION RESULT")
+    logger.info(SEPARATOR)
+    logger.info("")
+    logger.info("  Personas detected as High Risk : %s / %s  (%d%%)",
+                f"{passed}", f"{total}", int(pct))
 
     if all_passed:
-        print("  [PASS] All attack personas correctly detected.")
-        print("         The system is working as expected.")
+        logger.info("  [PASS] All attack personas correctly detected.")
     else:
         missed = scored_personas[scored_personas["risk_level"] != "High"]["user"].tolist()
-        print(f"  [WARN] Some personas were not detected as High Risk: {missed}")
-        print("         Consider adjusting THRESHOLD_HIGH or CONTAMINATION.")
+        logger.warning("  [WARN] Some personas not detected as High Risk: %s", missed)
 
 
 # ─────────────────────────────────────────────
 # SAVE SIMULATION RESULTS
 # ─────────────────────────────────────────────
 
-def save_simulation_results(combined_df: pd.DataFrame):
+def save_simulation_results(combined_df: pd.DataFrame) -> None:
     """
     Save combined real + simulated results to CSV.
+
+    Args:
+        combined_df: DataFrame with is_simulated flag.
+
+    Example:
+        >>> save_simulation_results(combined)
     """
     os.makedirs("outputs", exist_ok=True)
     combined_df.to_csv(SIM_OUTPUT_PATH, index=False)
-    print(f"\n  [SAVE] Simulation results saved -> {SIM_OUTPUT_PATH}")
+    logger.info("  Simulation results saved -> %s", SIM_OUTPUT_PATH)
 
 
 # ─────────────────────────────────────────────
 # MASTER PIPELINE FUNCTION
 # ─────────────────────────────────────────────
 
-def run_attack_simulation() -> tuple:
+def run_attack_simulation() -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Master function for the full attack simulation pipeline.
-    Called by the dashboard.
+    Execute the full attack simulation pipeline: build, load, score, combine, save.
 
     Returns:
-        scored_personas : DataFrame of scored simulated users only
-        combined_df     : DataFrame of real + simulated users combined
-    """
-    print(f"\n{SEPARATOR}")
-    print("  STAGE 7 - Attack Simulation Pipeline")
-    print(SEPARATOR)
+        Tuple of (scored_personas, combined_df).
 
-    # Step 1 - Build personas
-    print("\n  [1/5] Building attack personas...")
+    Example:
+        >>> sp, comb = run_attack_simulation()
+    """
+    logger.info("")
+    logger.info(SEPARATOR)
+    logger.info("  STAGE 6 — Attack Simulation Pipeline")
+    logger.info(SEPARATOR)
+
+    logger.info("")
+    logger.info("  [1/6] Building attack personas...")
     personas_df = build_attack_personas()
 
-    # Step 2 - Load model
-    print("\n  [2/5] Loading trained model and scaler...")
+    logger.info("")
+    logger.info("  [2/6] Loading trained model and scaler...")
     model, scaler = load_model_artifacts()
 
-    # Step 3 - Score personas
-    print("\n  [3/5] Scoring simulated personas...")
+    logger.info("")
+    logger.info("  [3/6] Scoring simulated personas...")
     scored_personas = score_personas(personas_df, model, scaler)
 
-    # Step 4 - Combine with real data
-    print("\n  [4/5] Combining with real user data...")
+    logger.info("")
+    logger.info("  [4/6] Combining with real user data...")
     combined_df = combine_with_real_data(scored_personas)
 
-    # Step 5 - Save results
-    print("\n  [5/5] Saving simulation results...")
+    logger.info("")
+    logger.info("  [5/6] Saving simulation report...")
+    save_simulation_report(scored_personas)
+
+    logger.info("")
+    logger.info("  [6/6] Saving simulation results...")
     save_simulation_results(combined_df)
 
     return scored_personas, combined_df
 
 
 # ─────────────────────────────────────────────
-# SELF-TEST  (run this file directly)
+# SELF-TEST
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-
+    logging.getLogger().setLevel(logging.INFO)
     scored_personas, combined_df = run_attack_simulation()
-
     print_simulation_report(scored_personas)
 
     print(f"\n{SEPARATOR}")
     print("  TOP 10 USERS IN COMBINED DATASET")
     print(SEPARATOR)
-
-    top10 = combined_df.nlargest(10, "risk_score")[[
-        "user", "risk_score", "risk_level",
-        "is_anomaly", "is_simulated"
-    ]]
+    top10 = combined_df.nlargest(10, "risk_score")[["user", "risk_score", "risk_level",
+                                                     "is_anomaly", "is_simulated"]]
     print(top10.to_string(index=False))
-
-    print(f"\n{SEPARATOR}")
-    print("  [OK] Stage 7 complete - ready for dashboard in Stage 8")
-    print(SEPARATOR)

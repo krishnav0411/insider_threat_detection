@@ -1,0 +1,81 @@
+# config.yaml
+# Central configuration for the Insider Threat Detection system.
+# All thresholds, paths, and hyperparameters live here.
+# Every src module reads from this file via src/config.py.
+
+paths:
+  data:
+    logon: "data/logon.csv"
+    device: "data/device.csv"
+  output:
+    feature_table: "outputs/user_features.csv"
+    scored_results: "outputs/user_scores.csv"
+    risk_report: "outputs/risk_report.csv"
+    model: "outputs/isolation_forest_model.pkl"
+    scaler: "outputs/scaler.pkl"
+    metadata: "outputs/model_metadata.json"
+    simulation_results: "outputs/simulated_results.csv"
+    simulation_report: "outputs/simulation_report.txt"
+
+preprocessing:
+  # Off-hours window definition
+  off_hour_start: 18     # 6 PM
+  off_hour_end: 8        # 8 AM
+
+model:
+  # Isolation Forest defaults (overridden by auto-selection when pipeline runs)
+  contamination_default: 0.05
+  contamination_candidates: [0.03, 0.05, 0.08, 0.10]
+  n_estimators: 100
+  random_state: 42
+
+risk_scoring:
+  # Risk level boundaries
+  threshold_high: 70.0
+  threshold_medium: 40.0
+  # Per-feature flag thresholds
+  flags:
+    login_count: 80
+    off_hour_logins: 15
+    off_hour_ratio: 0.25
+    weekend_logins: 10
+    weekend_ratio: 0.20
+    unique_pcs_logon: 3
+    device_connections: 30
+    unique_pcs_device: 3
+    late_night_logins: 10
+    device_to_login_ratio: 0.5
+    pc_diversity_score: 0.3
+    avg_session_gap_sec: 1800
+
+attack_simulation:
+  rule_weights:
+    excessive_logins: 5
+    off_hour_logins: 15
+    off_hour_ratio: 10
+    weekend_logins: 10
+    weekend_ratio: 3
+    unique_pcs_logon: 20
+    device_connections: 20
+    unique_pcs_device: 15
+    late_night_logins: 15
+    device_to_login_ratio: 20
+    pc_diversity_score: 15
+    avg_session_gap: 10
+    stealth_off_hour: 7
+
+features:
+  # The 12 feature columns used throughout the system
+  feature_cols:
+    - login_count
+    - off_hour_logins
+    - weekend_logins
+    - late_night_logins
+    - unique_pcs_logon
+    - off_hour_ratio
+    - weekend_ratio
+    - pc_diversity_score
+    - device_connections
+    - unique_pcs_device
+    - device_to_login_ratio
+    - avg_session_gap
